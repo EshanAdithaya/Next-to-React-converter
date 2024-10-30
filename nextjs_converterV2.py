@@ -47,8 +47,6 @@ class ConversionLogger:
         except tk.TclError:
             print("Warning: Failed to update log widget")
 
-
-
 class DependencyManager:
     """Handles project dependencies and package management"""
     
@@ -122,7 +120,7 @@ class DependencyManager:
         except Exception as e:
             self.logger.log(f"Error installing dependencies: {str(e)}", "ERROR")
             return False
-        
+
 class ProjectAnalyzer:
     def __init__(self, source_dir: str, logger: ConversionLogger):
         self.source_dir = Path(source_dir)
@@ -137,7 +135,7 @@ class ProjectAnalyzer:
             self.logger.log("Missing package.json file", "ERROR")
             return False
             
-        # Check for Next.js related files/dependencies more flexibly
+        # Check for Next.js related files/dependencies
         try:
             with open(self.source_dir / 'package.json') as f:
                 package_data = json.load(f)
@@ -146,7 +144,6 @@ class ProjectAnalyzer:
                     **package_data.get('devDependencies', {})
                 }
                 
-                # Look for any Next.js related dependencies
                 next_related = [dep for dep in dependencies if 'next' in dep.lower()]
                 if not next_related:
                     self.logger.log("No Next.js related dependencies found. Proceeding with caution...", "WARNING")
@@ -161,7 +158,7 @@ class ProjectAnalyzer:
         return True
     
     def analyze(self) -> Dict:
-        """Analyze the project structure recursively with detailed logging"""
+        """Analyze the project structure recursively"""
         if not self.validate_project():
             return {}
             
@@ -183,7 +180,6 @@ class ProjectAnalyzer:
             
             self.logger.log(f"Found {total_files} files to analyze")
             
-            # Recursively scan all directories
             for file in self.source_dir.rglob('*'):
                 if file.is_file():
                     processed += 1
@@ -220,7 +216,6 @@ class ProjectAnalyzer:
         
         # JavaScript/TypeScript files
         if rel_path.suffix in ['.js', '.jsx', '.tsx', '.ts']:
-            # Check file content for categorization
             try:
                 with open(self.source_dir / rel_path) as f:
                     content = f.read().lower()
@@ -281,20 +276,19 @@ class ProjectAnalyzer:
         self.logger.log(f"Config files found: {len(stats['config_files'])}")
         self.logger.log(f"Public assets found: {len(stats['public_assets'])}")
         
-        # Log file paths for verification
         for category, files in stats.items():
             if isinstance(files, list) and files:
                 self.logger.log(f"\n{category.replace('_', ' ').title()}:")
                 for file in files:
                     self.logger.log(f"  - {file}")
 
-                    class ProjectConverter:
+class ProjectConverter:
     def __init__(self, source_dir: str, target_dir: str, logger: ConversionLogger):
         self.source_dir = Path(source_dir)
         self.target_dir = Path(target_dir)
         self.logger = logger
         self.dependency_manager = DependencyManager(self.target_dir, logger)
-        
+    
     def setup_react_project(self) -> bool:
         """Initialize new React project with improved npm checking"""
         try:
@@ -360,9 +354,9 @@ class ProjectAnalyzer:
         except Exception as e:
             self.logger.log(f"Error setting up React project: {str(e)}", "ERROR")
             return False
-            
+    
     def _prepare_target_directory(self) -> bool:
-        """Prepare target directory for conversion with detailed logging"""
+        """Prepare target directory for conversion"""
         try:
             self.logger.log("Setting up project directory structure...")
             
@@ -389,8 +383,44 @@ import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
 
-const root = ReactDOM.createRoot(def convert_file(self, file_path: Path) -> Optional[str]:
-        """Convert a Next.js file to React with detailed logging"""
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+""")
+                self.logger.log("Created index.js")
+
+            # Create basic App.js if it doesn't exist
+            app_js = src_dir / 'App.js'
+            if not app_js.exists():
+                self.logger.log("Creating App.js...")
+                with open(app_js, 'w') as f:
+                    f.write("""
+import React from 'react';
+import { BrowserRouter as Router } from 'react-router-dom';
+
+function App() {
+  return (
+    <Router>
+      <div className="App">
+        {/* Your converted components will go here */}</div>
+    </Router>
+  );
+}
+
+export default App;
+""")
+                self.logger.log("Created App.js")
+
+            return True
+        except Exception as e:
+            self.logger.log(f"Error preparing target directory: {str(e)}", "ERROR")
+            return False
+    
+    def convert_file(self, file_path: Path) -> Optional[str]:
+        """Convert a Next.js file to React"""
         try:
             self.logger.log(f"Reading file: {file_path}")
             with open(file_path) as f:
@@ -505,13 +535,16 @@ useEffect(() => {{
     }};
     
     fetchData();
-}}, []);class ConverterGUI:
+}}, []);
+"""
+
+class ConverterGUI:
     def __init__(self):
         self.window = tk.Tk()
         self.window.title("Next.js to React Converter")
         self.window.geometry("800x600")
         self.setup_ui()
-        
+    
     def setup_ui(self):
         """Setup the UI components"""
         # Create main container
@@ -752,7 +785,9 @@ useEffect(() => {{
         else:
             self.convert_btn.config(state=tk.NORMAL)
             self.cancel_btn.config(state=tk.DISABLED)
-            self.conversion_active = Falsedef cancel_conversion(self):
+            self.conversion_active = False
+    
+    def cancel_conversion(self):
         """Cancel the ongoing conversion process"""
         if self.conversion_active:
             if messagebox.askyesno("Confirm", "Are you sure you want to cancel the conversion?"):
