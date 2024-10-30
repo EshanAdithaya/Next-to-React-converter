@@ -1,396 +1,595 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 import os
-import re
-import shutil
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
-import ast
+import sys
 import json
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
-import hashlib
-from rich.progress import Progress, TextColumn, BarColumn, TaskID
-from rich.console import Console
-from rich.panel import Panel
-import difflib
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import cssutils
+import shutil
+import subprocess
+import threading
+import queue
 import logging
+from datetime import datetime
+from pathlib import Path
+import re
+from typing import Optional, Dict, List, Tuple
+import time
 
-# Suppress cssutils parsing warnings
-cssutils.log.setLevel(logging.CRITICAL)
-
-@dataclass
-class ConversionConfig:
-    source_dir: str
-    output_dir: str
-    preserve_routes: bool = True
-    handle_api_routes: bool = True
-    use_llm: bool = False
-    threads: int = 4
-    verify_output: bool = True
-    backup: bool = True
-    preserve_css_modules: bool = True
-
-class ConversionTask:
-    def __init__(self, file_path: str, task_type: str, weight: int = 1):
-        self.file_path = file_path
-        self.task_type = task_type
-        self.weight = weight
-        self.status = "pending"
-        self.error = None
-
-class UIHashVerifier:
-    """Ensures UI elements remain exactly the same after conversion"""
-    
-    @staticmethod
-    def get_component_hash(content: str) -> str:
-        # Extract JSX/TSX structure
-        jsx_pattern = re.compile(r'<.*?>', re.DOTALL)
-        jsx_elements = jsx_pattern.findall(content)
-        return hashlib.md5(''.join(jsx_elements).encode()).hexdigest()
-    
-    @staticmethod
-    def verify_components(original: str, converted: str) -> Tuple[bool, List[str]]:
-        original_hash = UIHashVerifier.get_component_hash(original)
-        converted_hash = UIHashVerifier.get_component_hash(converted)
+class ConversionLogger:
+    def __init__(self, log_widget: scrolledtext.ScrolledText):
+        self.log_widget = log_widget
         
-        if original_hash != converted_hash:
-            diff = difflib.unified_diff(
-                original.splitlines(),
-                converted.splitlines(),
-                lineterm=''
-            )
-            return False, list(diff)
-        return True, []
-
-class StyleConverter:
-    """Handles CSS Modules and styled-components conversion"""
-    
-    @staticmethod
-    def convert_css_module(content: str, filename: str) -> str:
-        parser = cssutils.CSSParser()
-        sheet = parser.parseString(content)
-        
-        # Preserve all class names and their specificity
-        class_map = {}
-        for rule in sheet:
-            if rule.type == rule.STYLE_RULE:
-                selector = rule.selectorText
-                if '.' in selector:
-                    original_class = selector.split('.')[1]
-                    class_map[original_class] = original_class
-                    
-        return content, class_map
-
-class NextToReactConverter:
-    def __init__(self, config: ConversionConfig):
-        self.config = config
-        self.route_map: Dict[str, str] = {}
-        self.protected_routes: List[str] = []
-        self.tasks: List[ConversionTask] = []
-        self.console = Console()
-        self.progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=self.console
-        )
-        self.style_converter = StyleConverter()
-        self.verifier = UIHashVerifier()
-        
-    def create_backup(self):
-        """Create backup of source directory"""
-        if self.config.backup:
-            backup_dir = f"{self.config.source_dir}_backup_{int(time.time())}"
-            shutil.copytree(self.config.source_dir, backup_dir)
-            self.console.print(f"[green]Created backup at {backup_dir}")
-
-    def analyze_project(self) -> Dict[str, int]:
-        """Analyze project structure and calculate conversion metrics"""
-        metrics = {
-            'total_files': 0,
-            'components': 0,
-            'pages': 0,
-            'api_routes': 0,
-            'styles': 0,
-            'estimated_time': 0
-        }
-        
-        for root, _, files in os.walk(self.config.source_dir):
-            for file in files:
-                if file.endswith(('.tsx', '.jsx', '.css', '.scss')):
-                    metrics['total_files'] += 1
-                    file_path = os.path.join(root, file)
-                    
-                    if 'pages' in file_path:
-                        metrics['pages'] += 1
-                    elif 'components' in file_path:
-                        metrics['components'] += 1
-                    elif 'api' in file_path:
-                        metrics['api_routes'] += 1
-                    elif file.endswith(('.css', '.scss')):
-                        metrics['styles'] += 1
-                        
-        # Estimate conversion time (in seconds)
-        metrics['estimated_time'] = (
-            metrics['components'] * 2 +
-            metrics['pages'] * 3 +
-            metrics['api_routes'] * 1.5 +
-            metrics['styles'] * 1
+        # Setup logging configuration
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%H:%M:%S'
         )
         
-        return metrics
-
-    def setup_directory_structure(self):
-        """Create React project directory structure with progress tracking"""
-        directories = [
-            'src',
-            'src/components',
-            'src/pages',
-            'src/routes',
-            'src/hooks',
-            'src/styles',
-            'src/utils',
-            'src/context',
-            'src/assets'
-        ]
+    def log(self, message: str, level: str = "INFO"):
+        """Thread-safe logging to both widget and console"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] [{level}] {message}\n"
         
-        with self.progress:
-            task_id = self.progress.add_task(
-                "Setting up directory structure...",
-                total=len(directories)
-            )
-            
-            for directory in directories:
-                full_path = f"{self.config.output_dir}/{directory}"
-                os.makedirs(full_path, exist_ok=True)
-                self.progress.advance(task_id)
-
-    def convert_component(self, task: ConversionTask) -> Tuple[bool, Optional[str]]:
-        """Convert a single component with UI verification"""
+        # Log to console
+        print(formatted_message.strip())
+        
+        # Update UI in thread-safe way
+        if hasattr(self.log_widget, 'after'):
+            self.log_widget.after(0, self._append_log, formatted_message)
+    
+    def _append_log(self, message: str):
+        """Append message to log widget"""
         try:
-            with open(task.file_path, 'r') as f:
-                original_content = f.read()
+            self.log_widget.configure(state='normal')
+            self.log_widget.insert(tk.END, message)
+            self.log_widget.see(tk.END)
+            self.log_widget.configure(state='disabled')
+        except tk.TclError:
+            print("Warning: Failed to update log widget")
+
+class DependencyManager:
+    """Handles project dependencies and package management"""
+    
+    REQUIRED_PACKAGES = [
+        'react-router-dom',
+        'react-helmet',
+        '@emotion/styled',
+        '@emotion/react'
+    ]
+    
+    def __init__(self, target_dir: Path, logger: ConversionLogger):
+        self.target_dir = target_dir
+        self.logger = logger
+    
+    def check_npm_installation(self) -> bool:
+        """Check if npm is installed"""
+        try:
+            subprocess.run(['npm', '--version'], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self.logger.log("npm is not installed. Please install Node.js and npm first.", "ERROR")
+            return False
+    
+    def install_dependencies(self) -> bool:
+        """Install required dependencies"""
+        if not self.check_npm_installation():
+            return False
+            
+        try:
+            self.logger.log("Installing required dependencies...")
+            
+            for package in self.REQUIRED_PACKAGES:
+                self.logger.log(f"Installing {package}...")
+                result = subprocess.run(
+                    ['npm', 'install', '--save', package],
+                    cwd=str(self.target_dir),
+                    capture_output=True,
+                    text=True
+                )
                 
-            # Convert component
-            converted_content = self._transform_component(original_content)
+                if result.returncode != 0:
+                    self.logger.log(f"Failed to install {package}: {result.stderr}", "ERROR")
+                    return False
             
-            # Verify UI preservation
-            is_identical, diff = self.verifier.verify_components(
-                original_content,
-                converted_content
-            )
-            
-            if not is_identical:
-                return False, f"UI mismatch in {task.file_path}:\n" + '\n'.join(diff)
-            
-            # Write converted component
-            output_path = self._get_output_path(task.file_path)
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            with open(output_path, 'w') as f:
-                f.write(converted_content)
-                
-            return True, None
+            return True
             
         except Exception as e:
-            return False, str(e)
+            self.logger.log(f"Error installing dependencies: {str(e)}", "ERROR")
+            return False
 
-    def _transform_component(self, content: str) -> str:
-        """Transform Next.js component to React while preserving exact UI"""
-        # Replace Next.js imports
+class ProjectAnalyzer:
+    def __init__(self, source_dir: str, logger: ConversionLogger):
+        self.source_dir = Path(source_dir)
+        self.logger = logger
+    
+    def validate_project(self) -> bool:
+        """Validate Next.js project structure"""
+        required_files = ['package.json', 'next.config.js']
+        required_dirs = ['pages', 'public']
+        
+        for file in required_files:
+            if not (self.source_dir / file).exists():
+                self.logger.log(f"Missing required file: {file}", "ERROR")
+                return False
+        
+        for directory in required_dirs:
+            if not (self.source_dir / directory).is_dir():
+                self.logger.log(f"Missing required directory: {directory}", "ERROR")
+                return False
+        
+        return True
+    
+    def analyze(self) -> Dict:
+        """Analyze the Next.js project structure"""
+        if not self.validate_project():
+            return {}
+            
+        try:
+            stats = {
+                'components': [],
+                'pages': [],
+                'api_routes': [],
+                'styles': [],
+                'config_files': [],
+                'public_assets': [],
+                'dependencies': self._get_dependencies()
+            }
+            
+            # Analyze project structure
+            for file in self.source_dir.rglob('*'):
+                if file.is_file():
+                    rel_path = file.relative_to(self.source_dir)
+                    
+                    if file.suffix in ['.js', '.jsx', '.tsx', '.ts']:
+                        if 'pages' in rel_path.parts:
+                            if 'api' in rel_path.parts:
+                                stats['api_routes'].append(str(rel_path))
+                            else:
+                                stats['pages'].append(str(rel_path))
+                        elif 'components' in rel_path.parts:
+                            stats['components'].append(str(rel_path))
+                    elif file.suffix in ['.css', '.scss', '.sass']:
+                        stats['styles'].append(str(rel_path))
+                    elif file.name in ['next.config.js', 'package.json', 'tsconfig.json']:
+                        stats['config_files'].append(str(rel_path))
+                    elif 'public' in rel_path.parts:
+                        stats['public_assets'].append(str(rel_path))
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.log(f"Error analyzing project: {str(e)}", "ERROR")
+            return {}
+    
+    def _get_dependencies(self) -> Dict:
+        """Extract dependencies from package.json"""
+        try:
+            package_json = self.source_dir / 'package.json'
+            if package_json.exists():
+                with open(package_json) as f:
+                    data = json.load(f)
+                return {
+                    'dependencies': data.get('dependencies', {}),
+                    'devDependencies': data.get('devDependencies', {})
+                }
+        except Exception as e:
+            self.logger.log(f"Error reading dependencies: {str(e)}", "ERROR")
+        return {}
+
+class ProjectConverter:
+    def __init__(self, source_dir: str, target_dir: str, logger: ConversionLogger):
+        self.source_dir = Path(source_dir)
+        self.target_dir = Path(target_dir)
+        self.logger = logger
+        self.dependency_manager = DependencyManager(self.target_dir, logger)
+    
+    def setup_react_project(self) -> bool:
+        """Initialize new React project"""
+        try:
+            self.logger.log("Creating new React project...")
+            
+            # Check if target directory exists
+            if self.target_dir.exists():
+                self.logger.log("Target directory already exists. Please choose a different location.", "ERROR")
+                return False
+            
+            # Create React project using create-react-app
+            result = subprocess.run(
+                ['npx', '--yes', 'create-react-app', str(self.target_dir)],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            self.logger.log("React project created successfully")
+            
+            # Install additional dependencies
+            if not self.dependency_manager.install_dependencies():
+                return False
+            
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.log(f"Error creating React project: {e.stderr}", "ERROR")
+            return False
+        except Exception as e:
+            self.logger.log(f"Error setting up React project: {str(e)}", "ERROR")
+            return False
+    
+    def convert_file(self, file_path: Path) -> Optional[str]:
+        """Convert a Next.js file to React"""
+        try:
+            with open(file_path) as f:
+                content = f.read()
+            
+            # Convert Next.js specific code
+            content = self._convert_imports(content)
+            content = self._convert_routing(content)
+            content = self._convert_components(content)
+            content = self._convert_data_fetching(content)
+            
+            return content
+            
+        except Exception as e:
+            self.logger.log(f"Error converting {file_path}: {str(e)}", "ERROR")
+            return None
+    
+    def _convert_imports(self, content: str) -> str:
+        """Convert Next.js imports to React equivalents"""
+        replacements = {
+            r'import\s+.*?\s+from\s+[\'"]next/router[\'"]': 'import { useNavigate, useLocation, useParams } from "react-router-dom"',
+            r'import\s+.*?\s+from\s+[\'"]next/link[\'"]': 'import { Link } from "react-router-dom"',
+            r'import\s+.*?\s+from\s+[\'"]next/image[\'"]': 'import { LazyLoadImage } from "react-lazy-load-image-component"',
+            r'import\s+.*?\s+from\s+[\'"]next/head[\'"]': 'import { Helmet } from "react-helmet"'
+        }
+        
+        for pattern, replacement in replacements.items():
+            content = re.sub(pattern, replacement, content)
+        return content
+    
+    def _convert_routing(self, content: str) -> str:
+        """Convert Next.js routing to React Router"""
+        # Convert useRouter hooks
+        content = content.replace('useRouter()', 'useNavigate()')
+        content = content.replace('router.push(', 'navigate(')
+        content = content.replace('router.replace(', 'navigate(')
+        
+        # Convert query parameters
+        content = content.replace('router.query', 'new URLSearchParams(useLocation().search)')
+        
+        # Convert Link components
         content = re.sub(
-            r'import\s+{\s*useRouter\s*}\s+from\s+[\'"]next/router[\'"]',
-            'import { useNavigate, useLocation } from "react-router-dom"',
+            r'<Link\s+href=([\'"].*?[\'"])',
+            r'<Link to=\1',
             content
         )
         
-        # Convert Next.js Image component while preserving exact styling
+        return content
+    
+    def _convert_components(self, content: str) -> str:
+        """Convert Next.js specific components"""
+        # Convert Image component
         content = re.sub(
             r'<Image\s+([^>]*?)src=([\'"].*?[\'"])\s*([^>]*?)/?>',
-            lambda m: self._convert_image_tag(m.group(1), m.group(2), m.group(3)),
+            r'<LazyLoadImage src=\2 \1 \3 />',
             content
         )
         
-        # Preserve exact styling from CSS modules
-        if '.module.' in content:
-            content = self._preserve_css_modules(content)
-            
+        # Convert Head component
+        content = re.sub(
+            r'<Head>(.*?)</Head>',
+            r'<Helmet>\1</Helmet>',
+            content,
+            flags=re.DOTALL
+        )
+        
         return content
-
-    def _convert_image_tag(self, prefix: str, src: str, suffix: str) -> str:
-        """Convert Next.js Image to img while preserving exact styling"""
-        style_props = {}
-        
-        # Extract width and height
-        width_match = re.search(r'width=[\'"]\d+[\'"]', prefix + suffix)
-        height_match = re.search(r'height=[\'"]\d+[\'"]', prefix + suffix)
-        
-        if width_match:
-            style_props['width'] = width_match.group(0).split('=')[1].strip('\'"')
-        if height_match:
-            style_props['height'] = height_match.group(0).split('=')[1].strip('\'"')
-            
-        style_str = ' '.join([f'{k}={v}' for k, v in style_props.items()])
-        return f'<img src={src} {style_str} loading="lazy" />'
-
-    def _preserve_css_modules(self, content: str) -> str:
-        """Ensure CSS modules are preserved exactly"""
-        # Extract CSS module imports
-        css_imports = re.findall(
-            r'import\s+(\w+)\s+from\s+[\'"](.+?\.module\.css)[\'"]',
+    
+    def _convert_data_fetching(self, content: str) -> str:
+        """Convert Next.js data fetching methods"""
+        # Convert getStaticProps
+        content = re.sub(
+            r'export\s+async\s+function\s+getStaticProps\s*\([^)]*\)\s*{([^}]*)}',
+            lambda m: self._convert_to_use_effect(m.group(1)),
             content
         )
         
-        for var_name, css_path in css_imports:
-            # Read and parse CSS module
-            with open(css_path, 'r') as f:
-                css_content = f.read()
-                
-            # Convert while preserving classes
-            converted_css, class_map = self.style_converter.convert_css_module(
-                css_content,
-                css_path
-            )
-            
-            # Update class references in JSX
-            for original, converted in class_map.items():
-                content = re.sub(
-                    fr'{var_name}\.{original}',
-                    f'{var_name}.{converted}',
-                    content
-                )
-                
+        # Convert getServerSideProps
+        content = re.sub(
+            r'export\s+async\s+function\s+getServerSideProps\s*\([^)]*\)\s*{([^}]*)}',
+            lambda m: self._convert_to_use_effect(m.group(1)),
+            content
+        )
+        
         return content
+    
+    def _convert_to_use_effect(self, fetch_content: str) -> str:
+        """Convert Next.js data fetching to useEffect"""
+        return f"""
+const [data, setData] = useState(null);
+const [loading, setLoading] = useState(true);
 
-    def convert_with_progress(self):
-        """Main conversion process with detailed progress tracking"""
+useEffect(() => {{
+    const fetchData = async () => {{
+        try {{
+            setLoading(true);
+            {fetch_content}
+            setData(props);
+        }} catch (error) {{
+            console.error('Error fetching data:', error);
+        }} finally {{
+            setLoading(false);
+        }}
+    }};
+    
+    fetchData();
+}}, []);
+"""
+
+class ConverterGUI:
+    def __init__(self):
+        self.window = tk.Tk()
+        self.window.title("Next.js to React Converter")
+        self.window.geometry("800x600")
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup the UI components"""
+        # Create main container
+        main_frame = ttk.Frame(self.window, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        
+        # Directory selection
+        self._setup_directory_selection(main_frame)
+        
+        # Log area
+        self._setup_log_area(main_frame)
+        
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress = ttk.Progressbar(
+            main_frame,
+            variable=self.progress_var,
+            maximum=100
+        )
+        self.progress.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        # Convert button
+        self.convert_btn = ttk.Button(
+            main_frame,
+            text="Start Conversion",
+            command=self.start_conversion
+        )
+        self.convert_btn.grid(row=5, column=0, columnspan=3, pady=5)
+        
+        # Cancel button
+        self.cancel_btn = ttk.Button(
+            main_frame,
+            text="Cancel",
+            state=tk.DISABLED,
+            command=self.cancel_conversion
+        )
+        self.cancel_btn.grid(row=5, column=2, pady=5)
+        
+        self.conversion_active = False
+    
+    def _setup_directory_selection(self, parent):
+        """Setup directory selection widgets"""
+        # Source directory
+        ttk.Label(parent, text="Source Next.js Project:").grid(row=0, column=0, sticky=tk.W)
+        self.source_entry = ttk.Entry(parent, width=50)
+        self.source_entry.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        ttk.Button(
+            parent,
+            text="Browse",
+            command=lambda: self._browse_directory(self.source_entry)
+        ).grid(row=0, column=2, padx=5)
+        
+        # Target directory
+        ttk.Label(parent, text="Target Directory:").grid(row=1, column=0, sticky=tk.W)
+        self.target_entry = ttk.Entry(parent, width=50)
+        self.target_entry.grid(row=1, column=1, sticky=(tk.W, tk.E))
+        ttk.Button(
+            parent,
+            text="Browse",
+            command=lambda: self._browse_directory(self.target_entry)
+      ).grid(row=1, column=2, padx=5)
+    
+    def _setup_log_area(self, parent):
+        """Setup logging area"""
+        log_frame = ttk.LabelFrame(parent, text="Conversion Log", padding="5")
+        log_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        
+        self.log_widget = scrolledtext.ScrolledText(
+            log_frame,
+            height=15,
+            width=70,
+            state='disabled'
+        )
+        self.log_widget.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        self.logger = ConversionLogger(self.log_widget)
+    
+    def _browse_directory(self, entry_widget):
+        """Handle directory selection"""
+        directory = filedialog.askdirectory()
+        if directory:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, directory)
+    
+    def start_conversion(self):
+        """Start the conversion process"""
+        source_dir = self.source_entry.get()
+        target_dir = self.target_entry.get()
+        
+        if not source_dir or not target_dir:
+            messagebox.showerror("Error", "Please select both source and target directories")
+            return
+        
+        if not os.path.exists(source_dir):
+            messagebox.showerror("Error", "Source directory does not exist")
+            return
+        
+        if os.path.exists(target_dir):
+            if not messagebox.askyesno("Warning", "Target directory already exists. Do you want to continue?"):
+                return
+        
+        self.convert_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+        self.conversion_active = True
+        self.progress_var.set(0)
+        
+        # Start conversion in separate thread
+        self.conversion_thread = threading.Thread(
+            target=self._run_conversion,
+            args=(source_dir, target_dir)
+        )
+        self.conversion_thread.start()
+        
+        # Start progress update
+        self.window.after(100, self._check_conversion_status)
+    
+    def cancel_conversion(self):
+        """Cancel the ongoing conversion process"""
+        if self.conversion_active:
+            if messagebox.askyesno("Confirm", "Are you sure you want to cancel the conversion?"):
+                self.conversion_active = False
+                self.logger.log("Conversion cancelled by user", "WARNING")
+                self._cleanup_incomplete_conversion()
+    
+    def _cleanup_incomplete_conversion(self):
+        """Clean up partially converted project"""
+        target_dir = self.target_entry.get()
+        if os.path.exists(target_dir):
+            try:
+                shutil.rmtree(target_dir)
+                self.logger.log("Cleaned up incomplete conversion", "INFO")
+            except Exception as e:
+                self.logger.log(f"Error cleaning up: {str(e)}", "ERROR")
+    
+    def _check_conversion_status(self):
+        """Check conversion thread status"""
+        if self.conversion_thread.is_alive():
+            self.window.after(100, self._check_conversion_status)
+        else:
+            self.convert_btn.config(state=tk.NORMAL)
+            self.cancel_btn.config(state=tk.DISABLED)
+            self.conversion_active = False
+    
+    def _run_conversion(self, source_dir: str, target_dir: str):
+        """Run the conversion process"""
         try:
             # Analyze project
-            metrics = self.analyze_project()
-            self.console.print(Panel.fit(
-                f"Project Analysis:\n"
-                f"Total Files: {metrics['total_files']}\n"
-                f"Components: {metrics['components']}\n"
-                f"Pages: {metrics['pages']}\n"
-                f"API Routes: {metrics['api_routes']}\n"
-                f"Styles: {metrics['styles']}\n"
-                f"Estimated Time: {metrics['estimated_time']}s"
-            ))
+            self.logger.log("Analyzing project structure...")
+            analyzer = ProjectAnalyzer(source_dir, self.logger)
+            project_stats = analyzer.analyze()
             
-            # Create backup
-            self.create_backup()
+            if not project_stats:
+                self.logger.log("Project analysis failed", "ERROR")
+                return
             
-            with self.progress:
-                # Setup structure
-                setup_task = self.progress.add_task(
-                    "Setting up project structure...",
-                    total=1
-                )
-                self.setup_directory_structure()
-                self.progress.update(setup_task, completed=1)
-                
-                # Convert components
-                conversion_task = self.progress.add_task(
-                    "Converting components...",
-                    total=metrics['total_files']
-                )
-                
-                with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-                    futures = []
-                    
-                    for task in self.tasks:
-                        future = executor.submit(self.convert_component, task)
-                        futures.append((future, task))
-                        
-                    for future, task in futures:
-                        success, error = future.result()
-                        if not success:
-                            self.console.print(f"[red]Error converting {task.file_path}:")
-                            self.console.print(error)
-                        self.progress.advance(conversion_task)
-                
-                # Generate additional files
-                config_task = self.progress.add_task(
-                    "Generating configuration...",
-                    total=3
-                )
-                
-                self.generate_react_router_config()
-                self.progress.advance(config_task)
-                
-                self.generate_package_json()
-                self.progress.advance(config_task)
-                
-                self.generate_webpack_config()
-                self.progress.advance(config_task)
-                
-            self.console.print("[green]Conversion completed successfully!")
+            self.logger.log("\nProject Analysis:")
+            self.logger.log(f"Components: {len(project_stats['components'])}")
+            self.logger.log(f"Pages: {len(project_stats['pages'])}")
+            self.logger.log(f"API Routes: {len(project_stats['api_routes'])}")
+            self.logger.log(f"Style Files: {len(project_stats['styles'])}")
+            self.logger.log(f"Public Assets: {len(project_stats['public_assets'])}")
+            
+            # Initialize converter
+            converter = ProjectConverter(source_dir, target_dir, self.logger)
+            
+            # Setup React project
+            self.progress_var.set(10)
+            if not converter.setup_react_project():
+                self.logger.log("Failed to create React project", "ERROR")
+                return
+            
+            if not self.conversion_active:
+                return
+            
+            # Convert files
+            self._convert_files(converter, project_stats)
+            
+            # Copy public assets
+            if self.conversion_active:
+                self._copy_public_assets(source_dir, target_dir, project_stats['public_assets'])
+            
+            if self.conversion_active:
+                self.logger.log("Conversion completed successfully!")
+                messagebox.showinfo("Success", "Project conversion completed successfully!")
             
         except Exception as e:
-            self.console.print(f"[red]Error during conversion: {str(e)}")
-            if self.config.backup:
-                self.console.print(
-                    "[yellow]Restore from backup to revert changes."
-                )
-
-    def generate_webpack_config(self):
-        """Generate webpack config to match Next.js behavior"""
-        config = {
-            'entry': './src/index.js',
-            'module': {
-                'rules': [
-                    {
-                        'test': r'/\.(js|jsx|ts|tsx)$/',
-                        'exclude': '/node_modules/',
-                        'use': {
-                            'loader': 'babel-loader',
-                            'options': {
-                                'presets': [
-                                    '@babel/preset-env',
-                                    '@babel/preset-react',
-                                    '@babel/preset-typescript'
-                                ]
-                            }
-                        }
-                    },
-                    {
-                        'test': r'/\.module\.css$/',
-                        'use': [
-                            'style-loader',
-                            {
-                                'loader': 'css-loader',
-                                'options': {
-                                    'modules': {
-                                        'localIdentName': '[name]__[local]__[hash:base64:5]'
-                                    }
-                                }
-                            }
-                        ]
-                    }
-                ]
-            },
-            'resolve': {
-                'extensions': ['.js', '.jsx', '.ts', '.tsx']
-            }
-        }
+            self.logger.log(f"Conversion failed: {str(e)}", "ERROR")
+            messagebox.showerror("Error", f"Conversion failed: {str(e)}")
+        finally:
+            self.convert_btn.config(state=tk.NORMAL)
+            self.cancel_btn.config(state=tk.DISABLED)
+            self.conversion_active = False
+    
+    def _convert_files(self, converter: ProjectConverter, project_stats: Dict):
+        """Convert all project files"""
+        total_files = sum(len(files) for files in project_stats.values() if isinstance(files, list))
+        processed = 0
         
-        with open(f"{self.config.output_dir}/webpack.config.js", 'w') as f:
-            f.write(f"module.exports = {json.dumps(config, indent=2)}")
+        for file_type, files in project_stats.items():
+            if not isinstance(files, list) or file_type == 'public_assets':
+                continue
+            
+            for file_path in files:
+                if not self.conversion_active:
+                    return
+                    
+                self.logger.log(f"Converting {file_path}...")
+                
+                source_file = converter.source_dir / file_path
+                target_file = converter.target_dir / 'src' / file_path
+                
+                if converted_content := converter.convert_file(source_file):
+                    os.makedirs(target_file.parent, exist_ok=True)
+                    with open(target_file, 'w', encoding='utf-8') as f:
+                        f.write(converted_content)
+                
+                processed += 1
+                self.progress_var.set(10 + (processed / total_files * 70))
+    
+    def _copy_public_assets(self, source_dir: str, target_dir: str, assets: List[str]):
+        """Copy public assets to React project"""
+        self.logger.log("Copying public assets...")
+        try:
+            for asset in assets:
+                if not self.conversion_active:
+                    return
+                    
+                source = Path(source_dir) / asset
+                target = Path(target_dir) / 'public' / asset.replace('public/', '')
+                
+                os.makedirs(target.parent, exist_ok=True)
+                shutil.copy2(source, target)
+            
+            self.progress_var.set(100)
+            
+        except Exception as e:
+            self.logger.log(f"Error copying assets: {str(e)}", "ERROR")
+    
+    def run(self):
+        """Start the application"""
+        self.window.mainloop()
+
+def main():
+    """Main entry point"""
+    try:
+        app = ConverterGUI()
+        app.run()
+    except Exception as e:
+        print(f"Fatal error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    config = ConversionConfig(
-        source_dir="./my-nextjs-app",
-        output_dir="./converted-react-app",
-        preserve_routes=True,
-        handle_api_routes=True,
-        use_llm=False,
-        threads=4,
-        verify_output=True,
-        backup=True,
-        preserve_css_modules=True
-    )
-    
-    converter = NextToReactConverter(config)
-    converter.convert_with_progress()
+    main()
