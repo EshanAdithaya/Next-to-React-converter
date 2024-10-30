@@ -60,42 +60,60 @@ class DependencyManager:
     def __init__(self, target_dir: Path, logger: ConversionLogger):
         self.target_dir = target_dir
         self.logger = logger
+        self._npm_checked = False
+        self._npm_available = False
     
     def check_npm_installation(self) -> bool:
-        """Check if npm is installed"""
+        """Check if npm is installed with proper caching"""
+        if self._npm_checked:
+            return self._npm_available
+            
         try:
-            subprocess.run(['npm', '--version'], capture_output=True, check=True)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self.logger.log("npm is not installed. Please install Node.js and npm first.", "ERROR")
+            result = subprocess.run(
+                ['npm', '--version'], 
+                capture_output=True, 
+                text=True,
+                shell=True if sys.platform == 'win32' else False
+            )
+            self._npm_available = result.returncode == 0
+            self._npm_checked = True
+            return self._npm_available
+        except Exception as e:
+            self.logger.log(f"Error checking npm: {str(e)}", "ERROR")
+            self._npm_available = False
+            self._npm_checked = True
             return False
     
     def install_dependencies(self) -> bool:
-        """Install required dependencies"""
+        """Install required dependencies with better error handling"""
         if not self.check_npm_installation():
+            self.logger.log("Cannot install dependencies: npm is not available", "ERROR")
             return False
             
         try:
             self.logger.log("Installing required dependencies...")
             
-            for package in self.REQUIRED_PACKAGES:
-                self.logger.log(f"Installing {package}...")
-                result = subprocess.run(
-                    ['npm', 'install', '--save', package],
-                    cwd=str(self.target_dir),
-                    capture_output=True,
-                    text=True
-                )
-                
-                if result.returncode != 0:
-                    self.logger.log(f"Failed to install {package}: {result.stderr}", "ERROR")
-                    return False
+            # Install all packages in a single command for better performance
+            packages_str = ' '.join(self.REQUIRED_PACKAGES)
+            result = subprocess.run(
+                f'npm install --save {packages_str}',
+                shell=True,
+                cwd=str(self.target_dir),
+                capture_output=True,
+                text=True
+            )
             
+            if result.returncode != 0:
+                self.logger.log(f"Failed to install dependencies: {result.stderr}", "ERROR")
+                return False
+                
+            self.logger.log("Successfully installed all dependencies")
             return True
             
         except Exception as e:
             self.logger.log(f"Error installing dependencies: {str(e)}", "ERROR")
             return False
+
 
 class ProjectAnalyzer:
     def __init__(self, source_dir: str, logger: ConversionLogger):
@@ -254,17 +272,21 @@ class ProjectConverter:
         self.target_dir = Path(target_dir)
         self.logger = logger
         self.dependency_manager = DependencyManager(self.target_dir, logger)
-
+        
     def setup_react_project(self) -> bool:
-        """Initialize new React project"""
+        """Initialize new React project with improved npm checking"""
         try:
             self.logger.log("Creating new React project...")
             
-            # If target directory exists, clean it up first
+            # Check npm availability first
+            if not self.dependency_manager.check_npm_installation():
+                self.logger.log("npm is not available. Please install Node.js and npm first.", "ERROR")
+                return False
+            
+            # Clean up target directory
             if self.target_dir.exists():
                 self.logger.log("Cleaning up existing target directory...")
                 try:
-                    # Remove everything except node_modules to speed up the process
                     for item in self.target_dir.iterdir():
                         if item.name != 'node_modules':
                             if item.is_file():
@@ -275,115 +297,45 @@ class ProjectConverter:
                     self.logger.log(f"Error cleaning target directory: {str(e)}", "ERROR")
                     return False
             else:
-                # Create the target directory if it doesn't exist
                 self.target_dir.mkdir(parents=True)
-
-            # First, try to run npm directly to check if it's available
-            try:
-                subprocess.run(['npm', '--version'], 
-                             check=True, 
-                             capture_output=True, 
-                             shell=True)
-            except subprocess.CalledProcessError:
-                self.logger.log("npm is not available. Please install Node.js and npm first.", "ERROR")
-                return False
-
-            # Create React project using npx create-react-app
+            
+            # Create React project
+            create_app_cmd = (
+                f'npx --yes create-react-app "{str(self.target_dir.absolute())}"'
+                if sys.platform == 'win32'
+                else ['npx', '--yes', 'create-react-app', str(self.target_dir.absolute())]
+            )
+            
             self.logger.log("Running create-react-app...")
+            result = subprocess.run(
+                create_app_cmd,
+                capture_output=True,
+                text=True,
+                shell=sys.platform == 'win32',
+                cwd=str(self.target_dir.parent)
+            )
             
-            # Use absolute path and normalize it for Windows
-            target_path = str(self.target_dir.absolute()).replace('\\', '/')
+            if result.returncode != 0:
+                self.logger.log(f"Error creating React project: {result.stderr}", "ERROR")
+                return False
             
-            # On Windows, we need to run this as a single command
-            if sys.platform == 'win32':
-                create_app_cmd = f'npx create-react-app "{target_path}"'
-            else:
-                create_app_cmd = ['npx', 'create-react-app', target_path]
-
-            try:
-                if sys.platform == 'win32':
-                    result = subprocess.run(
-                        create_app_cmd,
-                        capture_output=True,
-                        text=True,
-                        shell=True,
-                        cwd=str(self.target_dir.parent)  # Set working directory to parent of target
-                    )
-                else:
-                    result = subprocess.run(
-                        create_app_cmd,
-                        capture_output=True,
-                        text=True,
-                        cwd=str(self.target_dir.parent)
-                    )
-
-                if result.returncode != 0:
-                    error_msg = result.stderr or result.stdout
-                    self.logger.log(f"Error creating React project: {error_msg}", "ERROR")
-                    return False
-
-                self.logger.log("React project created successfully")
-
-            except Exception as e:
-                self.logger.log(f"Error executing create-react-app: {str(e)}", "ERROR")
-                self.logger.log("Trying alternative method...")
-                
-                # Try alternative method using npm init
-                try:
-                    # Initialize npm project
-                    npm_init = subprocess.run(
-                        'npm init -y',
-                        shell=True,
-                        cwd=str(self.target_dir),
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    if npm_init.returncode != 0:
-                        self.logger.log("Failed to initialize npm project", "ERROR")
-                        return False
-                    
-                    # Install React dependencies
-                    dependencies = [
-                        'react',
-                        'react-dom',
-                        'react-scripts',
-                        '@types/react',
-                        '@types/react-dom'
-                    ]
-                    
-                    install_cmd = f'npm install {" ".join(dependencies)}'
-                    npm_install = subprocess.run(
-                        install_cmd,
-                        shell=True,
-                        cwd=str(self.target_dir),
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    if npm_install.returncode != 0:
-                        self.logger.log("Failed to install React dependencies", "ERROR")
-                        return False
-                        
-                except Exception as e:
-                    self.logger.log(f"Alternative method failed: {str(e)}", "ERROR")
-                    return False
-
+            self.logger.log("React project created successfully")
+            
             # Install additional dependencies
             if not self.dependency_manager.install_dependencies():
                 return False
-
+            
             # Prepare directory structure
             if not self._prepare_target_directory():
                 return False
-
+            
             self.logger.log("React project setup completed successfully")
             return True
             
         except Exception as e:
             self.logger.log(f"Error setting up React project: {str(e)}", "ERROR")
             return False
-
+        
     def _prepare_target_directory(self) -> bool:
         """Prepare target directory for conversion"""
         try:
