@@ -103,24 +103,34 @@ class ProjectAnalyzer:
         self.logger = logger
     
     def validate_project(self) -> bool:
-        """Validate Next.js project structure"""
-        required_files = ['package.json', 'next.config.js']
-        required_dirs = ['pages', 'public']
-        
-        for file in required_files:
-            if not (self.source_dir / file).exists():
-                self.logger.log(f"Missing required file: {file}", "ERROR")
-                return False
-        
-        for directory in required_dirs:
-            if not (self.source_dir / directory).is_dir():
-                self.logger.log(f"Missing required directory: {directory}", "ERROR")
-                return False
+        """Validate project structure more flexibly"""
+        # Check for package.json
+        if not (self.source_dir / 'package.json').exists():
+            self.logger.log("Missing package.json file", "ERROR")
+            return False
+            
+        # Check for Next.js related files/dependencies more flexibly
+        try:
+            with open(self.source_dir / 'package.json') as f:
+                package_data = json.load(f)
+                dependencies = {
+                    **package_data.get('dependencies', {}),
+                    **package_data.get('devDependencies', {})
+                }
+                
+                # Look for any Next.js related dependencies
+                next_related = [dep for dep in dependencies if 'next' in dep.lower()]
+                if not next_related:
+                    self.logger.log("No Next.js related dependencies found. Proceeding with caution...", "WARNING")
+                
+        except Exception as e:
+            self.logger.log(f"Error reading package.json: {str(e)}", "ERROR")
+            return False
         
         return True
     
     def analyze(self) -> Dict:
-        """Analyze the Next.js project structure"""
+        """Analyze the project structure recursively"""
         if not self.validate_project():
             return {}
             
@@ -128,38 +138,81 @@ class ProjectAnalyzer:
             stats = {
                 'components': [],
                 'pages': [],
+                'layouts': [],
                 'api_routes': [],
                 'styles': [],
                 'config_files': [],
                 'public_assets': [],
-                'dependencies': self._get_dependencies()
+                'dependencies': self._get_dependencies(),
+                'project_type': 'custom'
             }
             
-            # Analyze project structure
+            # Recursively scan all directories
             for file in self.source_dir.rglob('*'):
                 if file.is_file():
                     rel_path = file.relative_to(self.source_dir)
+                    file_category = self._categorize_file(rel_path)
                     
-                    if file.suffix in ['.js', '.jsx', '.tsx', '.ts']:
-                        if 'pages' in rel_path.parts:
-                            if 'api' in rel_path.parts:
-                                stats['api_routes'].append(str(rel_path))
-                            else:
-                                stats['pages'].append(str(rel_path))
-                        elif 'components' in rel_path.parts:
-                            stats['components'].append(str(rel_path))
-                    elif file.suffix in ['.css', '.scss', '.sass']:
-                        stats['styles'].append(str(rel_path))
-                    elif file.name in ['next.config.js', 'package.json', 'tsconfig.json']:
-                        stats['config_files'].append(str(rel_path))
-                    elif 'public' in rel_path.parts:
-                        stats['public_assets'].append(str(rel_path))
+                    if file_category:
+                        stats[file_category].append(str(rel_path))
             
+            self._log_analysis_results(stats)
             return stats
             
         except Exception as e:
             self.logger.log(f"Error analyzing project: {str(e)}", "ERROR")
             return {}
+    
+    def _categorize_file(self, rel_path: Path) -> Optional[str]:
+        """Categorize file based on content and location"""
+        file_str = str(rel_path).lower()
+        
+        # Config files
+        if rel_path.name in [
+            'next.config.js', 'package.json', 'tsconfig.json',
+            'next-env.d.ts', 'next-sitemap.config.js'
+        ]:
+            return 'config_files'
+        
+        # Style files
+        if rel_path.suffix in ['.css', '.scss', '.sass', '.less']:
+            return 'styles'
+        
+        # JavaScript/TypeScript files
+        if rel_path.suffix in ['.js', '.jsx', '.tsx', '.ts']:
+            # Check file content for categorization
+            try:
+                with open(self.source_dir / rel_path) as f:
+                    content = f.read().lower()
+                    
+                    # API routes
+                    if ('api' in file_str and 
+                        any(pattern in content for pattern in ['req,', 'res,', 'response', 'request'])):
+                        return 'api_routes'
+                    
+                    # Components
+                    if (any(pattern in content for pattern in ['react', 'export default', '<']) and
+                        'components' in file_str):
+                        return 'components'
+                    
+                    # Pages
+                    if ('pages' in file_str or
+                        any(pattern in content for pattern in ['getstaticprops', 'getserversideprops'])):
+                        return 'pages'
+                    
+                    # Layouts
+                    if ('layout' in file_str or
+                        any(pattern in content for pattern in ['children', 'props.children'])):
+                        return 'layouts'
+                        
+            except Exception:
+                pass
+        
+        # Public assets
+        if 'public' in file_str or 'assets' in file_str:
+            return 'public_assets'
+        
+        return None
     
     def _get_dependencies(self) -> Dict:
         """Extract dependencies from package.json"""
@@ -175,6 +228,25 @@ class ProjectAnalyzer:
         except Exception as e:
             self.logger.log(f"Error reading dependencies: {str(e)}", "ERROR")
         return {}
+    
+    def _log_analysis_results(self, stats: Dict):
+        """Log analysis results"""
+        self.logger.log("\nProject Analysis Results:")
+        self.logger.log(f"Project Type: {stats['project_type']}")
+        self.logger.log(f"Components found: {len(stats['components'])}")
+        self.logger.log(f"Pages found: {len(stats['pages'])}")
+        self.logger.log(f"Layouts found: {len(stats['layouts'])}")
+        self.logger.log(f"API Routes found: {len(stats['api_routes'])}")
+        self.logger.log(f"Style files found: {len(stats['styles'])}")
+        self.logger.log(f"Config files found: {len(stats['config_files'])}")
+        self.logger.log(f"Public assets found: {len(stats['public_assets'])}")
+        
+        # Log file paths for verification
+        for category, files in stats.items():
+            if isinstance(files, list) and files:
+                self.logger.log(f"\n{category.replace('_', ' ').title()}:")
+                for file in files:
+                    self.logger.log(f"  - {file}")
 
 class ProjectConverter:
     def __init__(self, source_dir: str, target_dir: str, logger: ConversionLogger):
@@ -182,38 +254,191 @@ class ProjectConverter:
         self.target_dir = Path(target_dir)
         self.logger = logger
         self.dependency_manager = DependencyManager(self.target_dir, logger)
-    
+
     def setup_react_project(self) -> bool:
         """Initialize new React project"""
         try:
             self.logger.log("Creating new React project...")
             
-            # Check if target directory exists
+            # If target directory exists, clean it up first
             if self.target_dir.exists():
-                self.logger.log("Target directory already exists. Please choose a different location.", "ERROR")
+                self.logger.log("Cleaning up existing target directory...")
+                try:
+                    # Remove everything except node_modules to speed up the process
+                    for item in self.target_dir.iterdir():
+                        if item.name != 'node_modules':
+                            if item.is_file():
+                                item.unlink()
+                            else:
+                                shutil.rmtree(item)
+                except Exception as e:
+                    self.logger.log(f"Error cleaning target directory: {str(e)}", "ERROR")
+                    return False
+            else:
+                # Create the target directory if it doesn't exist
+                self.target_dir.mkdir(parents=True)
+
+            # First, try to run npm directly to check if it's available
+            try:
+                subprocess.run(['npm', '--version'], 
+                             check=True, 
+                             capture_output=True, 
+                             shell=True)
+            except subprocess.CalledProcessError:
+                self.logger.log("npm is not available. Please install Node.js and npm first.", "ERROR")
                 return False
+
+            # Create React project using npx create-react-app
+            self.logger.log("Running create-react-app...")
             
-            # Create React project using create-react-app
-            result = subprocess.run(
-                ['npx', '--yes', 'create-react-app', str(self.target_dir)],
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            # Use absolute path and normalize it for Windows
+            target_path = str(self.target_dir.absolute()).replace('\\', '/')
             
-            self.logger.log("React project created successfully")
-            
+            # On Windows, we need to run this as a single command
+            if sys.platform == 'win32':
+                create_app_cmd = f'npx create-react-app "{target_path}"'
+            else:
+                create_app_cmd = ['npx', 'create-react-app', target_path]
+
+            try:
+                if sys.platform == 'win32':
+                    result = subprocess.run(
+                        create_app_cmd,
+                        capture_output=True,
+                        text=True,
+                        shell=True,
+                        cwd=str(self.target_dir.parent)  # Set working directory to parent of target
+                    )
+                else:
+                    result = subprocess.run(
+                        create_app_cmd,
+                        capture_output=True,
+                        text=True,
+                        cwd=str(self.target_dir.parent)
+                    )
+
+                if result.returncode != 0:
+                    error_msg = result.stderr or result.stdout
+                    self.logger.log(f"Error creating React project: {error_msg}", "ERROR")
+                    return False
+
+                self.logger.log("React project created successfully")
+
+            except Exception as e:
+                self.logger.log(f"Error executing create-react-app: {str(e)}", "ERROR")
+                self.logger.log("Trying alternative method...")
+                
+                # Try alternative method using npm init
+                try:
+                    # Initialize npm project
+                    npm_init = subprocess.run(
+                        'npm init -y',
+                        shell=True,
+                        cwd=str(self.target_dir),
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if npm_init.returncode != 0:
+                        self.logger.log("Failed to initialize npm project", "ERROR")
+                        return False
+                    
+                    # Install React dependencies
+                    dependencies = [
+                        'react',
+                        'react-dom',
+                        'react-scripts',
+                        '@types/react',
+                        '@types/react-dom'
+                    ]
+                    
+                    install_cmd = f'npm install {" ".join(dependencies)}'
+                    npm_install = subprocess.run(
+                        install_cmd,
+                        shell=True,
+                        cwd=str(self.target_dir),
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if npm_install.returncode != 0:
+                        self.logger.log("Failed to install React dependencies", "ERROR")
+                        return False
+                        
+                except Exception as e:
+                    self.logger.log(f"Alternative method failed: {str(e)}", "ERROR")
+                    return False
+
             # Install additional dependencies
             if not self.dependency_manager.install_dependencies():
                 return False
-            
+
+            # Prepare directory structure
+            if not self._prepare_target_directory():
+                return False
+
+            self.logger.log("React project setup completed successfully")
             return True
             
-        except subprocess.CalledProcessError as e:
-            self.logger.log(f"Error creating React project: {e.stderr}", "ERROR")
-            return False
         except Exception as e:
             self.logger.log(f"Error setting up React project: {str(e)}", "ERROR")
+            return False
+
+    def _prepare_target_directory(self) -> bool:
+        """Prepare target directory for conversion"""
+        try:
+            # Create src directory if it doesn't exist
+            src_dir = self.target_dir / 'src'
+            src_dir.mkdir(exist_ok=True)
+            
+            # Create necessary subdirectories
+            subdirs = ['components', 'pages', 'assets', 'styles', 'layouts', 'hooks', 'utils']
+            for dir_name in subdirs:
+                subdir = src_dir / dir_name
+                subdir.mkdir(exist_ok=True)
+
+            # Create basic index.js if it doesn't exist
+            index_js = src_dir / 'index.js'
+            if not index_js.exists():
+                with open(index_js, 'w') as f:
+                    f.write("""
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+""")
+
+            # Create basic App.js if it doesn't exist
+            app_js = src_dir / 'App.js'
+            if not app_js.exists():
+                with open(app_js, 'w') as f:
+                    f.write("""
+import React from 'react';
+import { BrowserRouter as Router } from 'react-router-dom';
+
+function App() {
+  return (
+    <Router>
+      <div className="App">
+        {/* Your converted components will go here */}
+      </div>
+    </Router>
+  );
+}
+
+export default App;
+""")
+
+            return True
+        except Exception as e:
+            self.logger.log(f"Error preparing target directory: {str(e)}", "ERROR")
             return False
     
     def convert_file(self, file_path: Path) -> Optional[str]:
