@@ -122,9 +122,23 @@ class DependencyManager:
             return False
 
 class ProjectAnalyzer:
-    def __init__(self, source_dir: str, logger: ConversionLogger):
+        
+        EXCLUDED_PATTERNS = {
+        'node_modules',
+        '.next',
+        '.git',
+        'dist',
+        'build',
+        '__pycache__',
+        '.env'
+    }
+     def __init__(self, source_dir: str, logger: ConversionLogger):
         self.source_dir = Path(source_dir)
         self.logger = logger
+    
+    def should_skip_path(self, path: Path) -> bool:
+        """Check if a path should be skipped during analysis"""
+        return any(excluded in path.parts for excluded in self.EXCLUDED_PATTERNS)
     
     def validate_project(self) -> bool:
         """Validate project structure more flexibly"""
